@@ -1,0 +1,17 @@
+# Installed by regolith-linux-fedora/actions tools/install-fedora-workflows.sh
+name: Fedora Publish to Testing
+
+# Manual until the testing promotion (Fedora Task 07-01) decides which releases
+# go to regolith-testing: run it on a fedora/v* tag. Then trigger on tag push:
+#
+#   push:
+#     tags:
+#       - "fedora/v*"
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: startsWith(github.ref, 'refs/tags/fedora/v')
+    uses: regolith-linux-fedora/actions/.github/workflows/fedora-publish-testing.yml@fedora/main
+    secrets: inherit
