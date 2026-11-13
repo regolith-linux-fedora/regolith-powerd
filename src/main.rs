@@ -107,22 +107,12 @@ impl Manager {
 
         if self.power_settings.idle_dim() {
             let idle_brightness = self.power_settings.idle_brightness();
-            let action = format!(
-                r#"
-                export curr_brightness=$(light)
-                echo $curr_brightness | tee $XDG_RUNTIME_DIR/screen_brightness_old.var
-                if [ 1 -eq "$(echo "${{curr_brightness}} > {idle_brightness}" | bc)" ]; then
-                    light -S {idle_brightness}
-                fi
-                "#,
-            );
+            let action = dim_cmd(idle_brightness);
 
             // Dim screen to $idle_brightness when idle dim timeout hit
             let dim_timeout_sec = self.session_settings.idle_delay();
             let mut swayidle_dim_timeout_args = Self::get_timeout_cmd(dim_timeout_sec, &action);
-            let mut swayidle_dim_resume_args = Self::get_resume_cmd(&format!(
-                "light -S $(cat $XDG_RUNTIME_DIR/screen_brightness_old.var)"
-            ));
+            let mut swayidle_dim_resume_args = Self::get_resume_cmd(&undim_cmd());
             args.append(&mut swayidle_dim_timeout_args);
             args.append(&mut swayidle_dim_resume_args);
 
@@ -219,6 +209,54 @@ impl Manager {
     fn get_resume_cmd(action: &str) -> Vec<String> {
         vec!["resume".to_owned(), action.to_owned()]
     }
+}
+
+/// A POSIX shell function, `brightness`, that prints the backlight
+/// brightness in percent, or sets it to the percentage given as its argument.
+///
+/// It uses brightnessctl when it is installed, which changes the brightness
+/// through logind and needs no setuid binary, and light otherwise.
+const BRIGHTNESS_SHELL_FN: &str = r#"brightness() {
+    if command -v brightnessctl >/dev/null 2>&1; then
+        if [ $# -eq 0 ]; then
+            brightnessctl -m -c backlight | cut -d, -f4 | tr -d %
+        else
+            brightnessctl -q -c backlight set "$1%"
+        fi
+    elif [ $# -eq 0 ]; then
+        light
+    else
+        light -S "$1"
+    fi
+}"#;
+
+/// Where the brightness from before the dim is kept, for `undim_cmd`.
+const SAVED_BRIGHTNESS: &str = "$XDG_RUNTIME_DIR/screen_brightness_old.var";
+
+/// Shell command that saves the brightness and dims the screen to
+/// `idle_brightness` percent, if it is brighter than that.
+fn dim_cmd(idle_brightness: i32) -> String {
+    format!(
+        r#"{BRIGHTNESS_SHELL_FN}
+curr_brightness=$(brightness)
+echo "$curr_brightness" > "{SAVED_BRIGHTNESS}"
+if [ "${{curr_brightness%%.*}}" -gt {idle_brightness} ] 2>/dev/null; then
+    brightness {idle_brightness}
+fi
+"#
+    )
+}
+
+/// Shell command that restores the brightness saved by `dim_cmd`.
+fn undim_cmd() -> String {
+    format!(
+        r#"{BRIGHTNESS_SHELL_FN}
+old_brightness=$(cat "{SAVED_BRIGHTNESS}" 2>/dev/null)
+if [ -n "$old_brightness" ]; then
+    brightness "$old_brightness"
+fi
+"#
+    )
 }
 
 /// Where the power supply class lives in sysfs.
@@ -346,15 +384,18 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A fake /sys/class/power_supply, removed when dropped.
     struct FakeSysfs(PathBuf);
 
     impl FakeSysfs {
         fn new(name: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "regolith-powerd-test-{}-{name}",
-                std::process::id()
+                "regolith-powerd-test-{}-{}-{name}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
@@ -397,6 +438,92 @@ mod tests {
 
     const AC: (bool, bool) = (true, false);
     const BATTERY: (bool, bool) = (false, true);
+
+    /// Run `cmd` with fake brightnessctl (if `with_brightnessctl`) and light
+    /// commands that report `current` and log their calls. Returns the calls.
+    fn brightness_calls(cmd: &str, with_brightnessctl: bool, current: &str) -> Vec<String> {
+        let dir = FakeSysfs::new("brightness");
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = dir.path().join("calls");
+        let percent = current.split('.').next().unwrap();
+        let mut tools = vec![(
+            "light",
+            format!("echo \"light $*\" >> {log:?}; [ $# -eq 0 ] && echo {current}; true"),
+        )];
+        if with_brightnessctl {
+            tools.push((
+                "brightnessctl",
+                format!(
+                    "echo \"brightnessctl $*\" >> {log:?}; \
+                     [ \"$1\" = -m ] && echo intel_backlight,backlight,750,{percent}%,1000; true"
+                ),
+            ));
+        }
+        for (name, body) in tools {
+            let path = bin.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            Command::new("chmod").arg("+x").arg(&path).status().unwrap();
+        }
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .env("PATH", path)
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn dims_with_brightnessctl_when_installed() {
+        let calls = brightness_calls(&dim_cmd(30), true, "75");
+        assert_eq!(
+            calls,
+            [
+                "brightnessctl -m -c backlight",
+                "brightnessctl -q -c backlight set 30%"
+            ]
+        );
+    }
+
+    #[test]
+    fn dims_with_light_otherwise() {
+        let calls = brightness_calls(&dim_cmd(30), false, "75.00");
+        assert_eq!(calls, ["light ", "light -S 30"]);
+    }
+
+    #[test]
+    fn leaves_a_darker_screen_alone() {
+        assert_eq!(
+            brightness_calls(&dim_cmd(30), true, "20"),
+            ["brightnessctl -m -c backlight"]
+        );
+        assert_eq!(brightness_calls(&dim_cmd(30), false, "20.00"), ["light "]);
+    }
+
+    #[test]
+    fn restores_the_saved_brightness() {
+        let cmd = format!("{}\n{}", dim_cmd(30), undim_cmd());
+        let calls = brightness_calls(&cmd, true, "75");
+        assert_eq!(calls.last().unwrap(), "brightnessctl -q -c backlight set 75%");
+        let calls = brightness_calls(&cmd, false, "75.00");
+        assert_eq!(calls.last().unwrap(), "light -S 75.00");
+    }
+
+    #[test]
+    fn no_backlight_is_harmless() {
+        let cmd = format!("{}\n{}", dim_cmd(30), undim_cmd());
+        // brightnessctl prints nothing without a backlight.
+        let calls = brightness_calls(&cmd, true, "");
+        assert!(calls.iter().all(|c| !c.contains(" set ")), "{calls:?}");
+    }
 
     #[test]
     fn ac_only() {
