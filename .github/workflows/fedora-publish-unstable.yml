@@ -1,0 +1,13 @@
+# Installed by regolith-linux-fedora/actions tools/install-fedora-workflows.sh
+name: Fedora Publish to Unstable
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "fedora/**"
+
+jobs:
+  publish:
+    uses: regolith-linux-fedora/actions/.github/workflows/fedora-publish-unstable.yml@fedora/main
+    secrets: inherit
