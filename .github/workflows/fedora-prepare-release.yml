@@ -1,0 +1,15 @@
+# Installed by regolith-linux-fedora/actions tools/install-fedora-workflows.sh
+name: Fedora Prepare a Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "fedora/**"
+    paths:
+      - "*.spec"
+
+jobs:
+  release:
+    uses: regolith-linux-fedora/actions/.github/workflows/fedora-prepare-release.yml@fedora/main
+    secrets: inherit
